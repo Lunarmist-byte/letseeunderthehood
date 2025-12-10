@@ -70,29 +70,128 @@ len=snprintf(msg,sizeof(msg),"{\"t\":%llu,\"pid\":%d,\"tgid\":%d,\"uid\":%u,\"co
 e->pid,e->tgid,__kuid_val(e->uid),e->comm,e->cpu,e->type,e->addr,
 (unsigned long long)e->val_lo,(unsigned long long)e->val_hi,e->regs_rip);
 
-if()
+if(nl_sk){
+    struct sk_buff *skb;
+    struct nlmsghdr *nlh;
+    int dst_pid=0; //*broadcast to all or single if pid known*
+    skb=nlmsg_new(len,GFP_ATOMIC);
+    if(skb){
+        nlh=nlmsg_put(skb,0,0,NLMSG_DONE,len,0);
+        if(!nlh){
+            kfree_skb(skb);
+        }else{
+            memcpy(nlmsg_data(nlh),msg,len);
+            /* send to userspace: multicast to groups 0 (no groups) - use nlmsg_unicast for simplicity if dst_pid known.*/
+            /* Here we do a simple netlink_broadcast so any listening processes get it if they joined the group (group 0 won't be listed).*/
+        rtnl_lock();
+        netlink_broadcast(nl_sk,skb,0,0,GFP_ATOMIC);
+        rtnl_unlock();
+        }
+    }
 
 }
+}
 
-static int regwatch_proc_show(struct seq_file *m,void *v)
+static int proc_show(struct seq_file *m,void *v)
 {
     unsigned int i;
     unsigned long flags;
     spin_lock_irqsave(&ring_lock,flags);
-    for(i=0;i<LOG_ENTRIES;++i){
+    for(i=0;i<RING_SIZE;++i){
         struct reg_event *e=&ring[i];
-        if(e->ts==0)
-            continue;
-        seq_printf(m,"%llu.%09llu pid=%d comm=%s cpu=%d type=%c addr=0x%lx "
-            "val_lo=0x%llx val_hi=0x%llx\n",(unsigned long long)ktime_to_ns(e->ts)/1000000000ULL,
-            (unsigned long long)ktime_to_ns(e->ts) % 1000000000ULL,
-            e->pid, e->comm, e->cpu, e->type, e->addr,
-            (unsigned long long)e->val_lo,
-            (unsigned long long)e->val_hi);
+        if(e->ts==0) continue;
+        seq_printf(m, "%llu pid=%d tgid=%d uid=%u comm=%s cpu=%d type=%c addr=0x%lx vlo=0x%llx vhi=0x%llx rip=0x%lx rax=0x%lx rbp=0x%lx rsp=0x%lx\n",
+                   (unsigned long long)ktime_to_ns(e->ts),
+                   e->pid, e->tgid, __kuid_val(e->uid), e->comm, e->cpu, e->type, e->addr,
+                   (unsigned long long)e->val_lo, (unsigned long long)e->val_hi, e->regs_rip, e->regs_rax, e->regs_rbp, e->regs_rsp);
     }
     spin_unlock_irqrestore(&ring_lock,flags);
     return 0;
+}
+static int proc_open(struct inode *inode,struct file *file){
+    return single_open(file,proc_show,NULL);
+}
+static const struct proc_ops proc_ops={
+    .proc_open=proc_open,
+    .proc_read=seq_read,
+    .proc_lseek=seq_lseek,
+    .proc_release=single_release,
+};
+
+static void fill_regs_snapshot(struct reg_event *ev,struct pt_regs *regs){/*capture basic snapshot*/
+    #if defined(CONFIG_X86_64) || defined(CONFIG_X86)
+        if(regs){
+    #if defined(CONFIG_X86_64)
+        ev->regs_rip=regs->ip;
+        ev->regs_rax=regs->ax;
+        ev->regs_rbx=regs->bx;
+        ev->regs_rcx=regs->cx;
+        ev->regs_rdx=regs->dx;
+        ev->regs_rsp=regs->sp;
+        ev->regs_rbp=regs->bp;
+#else
+        ev->regs_rip=regs->ip;
+        ev->regs_rax=regs->ax;
+        ev->regs_rbx=regs->bx;
+        ev->regs_rcx=regs->cx;
+        ev->regs_rdx=regs->dx;
+        ev->regs_rsp=regs->sp;
+        ev->regs_rbp=regs->bp;
+#endif
+    } else {
+        ev->regs_rip=0;
+        ev->regs_rax=0;
+        ev->regs_rbx=0;
+        ev->regs_rcx=0;
+        ev->regs_rdx=0;
+        ev->regs_rsp=0;
+        ev->regs_rbp=0;
     }
-    
+#else
+    /* Not supported arch so all are 0 out */
+    ev->regs_rip=ev->regs_rax=ev->regs_rbx=ev->regs_rcx=ev->regs_rdx=ev->regs_rsp=ev->regs_rbp=0;
+#endif
+}
+//Probe handlers with set of possible MSR helper names
+static const char *msr_read_symbols[]={
+    "do_rdmsr",
+    "rdmsr_safe",
+    "native_read_msr",
+    "do_read_msr"//common ones
+};
+static const char *msr_write_symbols[]={
+    "do_wrmsr",
+    "wrmsr_safe",
+    "native_write_msr",
+    "do_write_msr"
+};
+//kprobes for input pre-handling and kretprobes for capturing o/p
+static int generic_pre_msr(struct kprobe *p,struct pt_regs *regs){//probes where i/p args 
+    struct reg_event ev;
+    memset(&ev,0,sizeof(ev));
+    ev.ts=ktime_get();
+    ev.pid=current->pid;
+    ev.tgid=current->tgid;
+    ev.uid=current_uid();
+    get_task_comm(ev.comm,current);
+    ev.cpu=smp_processor_id();
+    ev.type='M';
+#if defined(CONFIG_X86_64) || defined(CONFIG_X86)
+    ev.addr=(unsigned long)regs->cx;//msr index in ecx
+    ev.val_ho=(unsigned long long)regs->ax;
+    ev.val_hi=(unsigned long long)regs->dx;
+#endif
+    fill_regs_snapshot(&ev,regs);
+    push_event_and_notify(&ev);
+    return 0;
+}
+static int msr_write_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct reg_event ev;
+    memset(&ev,0,sizeof(ev));
     
 }
+
+}
+
+    
