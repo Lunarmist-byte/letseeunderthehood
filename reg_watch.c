@@ -16,7 +16,7 @@
 #include<linux/uidgid.h>
 #include<linux/vmalloc.h>
 #include<asm/processor.h>
-#include<linux/spinlock.h>
+#include<linux/spinlock.h> 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Lunarmist-byte")
 MODULE_DESCRIPTION("log MSR and IO/MMIO accesses via kprobes")
@@ -189,6 +189,70 @@ static int msr_write_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
     struct reg_event ev;
     memset(&ev,0,sizeof(ev));
+    ev.ts=ktime_get();
+    ev.pid=current->pid;
+    ev.tgid=current->tgid;
+    ev.uid=current_uid();
+    get_task_comm(ev.comm,current);
+    ev.cpu=smp_processor_id();
+    ev.type='M';
+#if defined(CONFIG_X86_64) || defined(CONFIG_X86)
+    ev.addr=(unsigned long)regs->cx;
+    ev.val_lo=(unsigned long long)regs->ax;
+    ev.val_hi=(unsigned long long)regs->dx;
+#endif
+    fill_regs_snapshot(&ev,regs);
+    push_event_notify(&ev);
+    return 0;
+}
+/* arrays of kprobes/kretprobes,register them for the candidate symbol names. */
+#define MAX_PROBES 16
+static struct kprobe msr_pre_kps[MAX_PROBES];
+static struct kretprobe msr_read_kret;
+static struct kretprobe msr_write_kret;
+static int msr_pre_count=0;
+//IO/MMIO/PCI HANDLERS
+static int io_pre_handler(struct kprobe *p,struct pt_regs *regs)
+{
+    struct reg_event ev;
+    memset(&ev,0,sizeof(ev));
+    ev.ts=ktime_get();
+    ev.pid=current->pid;
+    ev.tgid=current->tgid;
+    ev.uid=current_uid();
+    get_task_comm(ev.comm,current);
+    ev.cpu=smp_processor_id();
+    //most i/o read/write accept void *addr as first arg on 64
+#if defined(CONFIG_X86_64)
+    ev.addr=(unsigned long)regs->di;
+#else
+    ev.addr=0;
+#endif
+    ev.type='R';
+    fill_regs_snapshot(&ev,regs);
+    push_event_notify(&ev);
+    return 0;
+
+}
+//PCI config r/wr pre handler
+static int pci_pre_handler(struct kprobe *p,struct pt_regs *regs)
+{
+    struct reg_event ev;
+    memset(&ev,0,sizeof(ev));
+        ev.ts=ktime_get();
+    ev.pid=current->pid;
+    ev.tgid=current->tgid;
+    ev.uid=current_uid();
+    get_task_comm(ev.comm,current);
+    ev.cpu=smp_processor_id();
+    //trying si and dx to get where port(maybe?)
+#if defined(CONFIG_X86_64)
+    ev.addr=(unsigned long)regs->si;//no gurantee
+#endif
+    ev.type='Q';
+    fill_regs_snapshot(&ev,regs);
+    push_event_notify(&ev);
+    return 0;
     
 }
 
